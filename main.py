@@ -3,6 +3,8 @@ import re
 import io
 import json
 import logging
+import base64
+from groq import Groq
 from datetime import datetime
 from typing import List
 from PIL import Image
@@ -19,6 +21,9 @@ from google.genai import types
 
 # 1. Carrega variáveis de ambiente e configura Log de Auditoria
 load_dotenv()
+
+groq_api_key = os.getenv("GROQ_API_KEY")
+groq_client = Groq(api_key=groq_api_key) if groq_api_key else None
 
 api_key = os.getenv("GEMINI_API_KEY")
 
@@ -71,7 +76,7 @@ def fallback_regex(texto_pdf: str) -> dict:
     print("Usando fallback local (Regex) devido à instabilidade na API externa...")
     matricula = re.search(r"MATRÍCULA Nº\s*([\d\.]+)", texto_pdf)
     proprietario = re.search(r"PROPRIETÁRI[OA] ADQUIRENTE:\s*([^,]+)", texto_pdf)
-    cpf = re.search(r"CPF sob nº\s*([\d\.\-]+\d)", texto_pdf)
+    cpf = re.search(r"\b\d{3}\.\d{3}\.\d{3}-\d{2}\b", texto_pdf)
     endereco = re.search(r"IMÓVEL:\s*(.+?)\.\n", texto_pdf, re.DOTALL)
     valor = re.search(r"VALOR DA TRANSAÇÃO:\s*(R\$\s*[\d\.,]+)", texto_pdf)
     onus = re.search(r"ÔNUS E GRAVAMES:\s*(.+)", texto_pdf)
@@ -87,14 +92,21 @@ def fallback_regex(texto_pdf: str) -> dict:
 
 
 def extrair_com_ia(conteudo_bytes: bytes, mime_type: str, texto_extraido: str = "") -> dict:
-    instrucao = f"""
+    instrucao = """
     Você é um analista de registro de imóveis.
-    Extraia exclusivamente os campos definidos no schema.
+    Extraia exclusivamente os seguintes campos em formato JSON válido, sem texto extra:
+    {
+      "matricula": "Número da matrícula do imóvel ou 'Não informado'",
+      "proprietario": "Nome completo do proprietário/comprador ou 'Não informado'",
+      "cpf": "CPF encontrado no documento ou 'Não informado'",
+      "endereco_imovel": "Endereço completo do imóvel ou 'Não informado'",
+      "valor_transacao": "Valor do imóvel/transação em reais ou 'Não informado'",
+      "status_onus": "Situação de ônus, hipoteca ou alienação ou 'Não informado'"
+    }
     Não invente informações.
-    Caso um campo não seja encontrado, retorne "Não informado".
     """
 
-    # Se temos texto nativo, mandamos texto; se for imagem ou PDF escaneado, mandamos os bytes direto (OCR Multimodal)
+    # --- CAMADA 1: Google Gemini (Família 3.x liberada na chave) ---
     if texto_extraido:
         contents = f"{instrucao}\n\nTexto:\n{texto_extraido}"
     else:
@@ -103,12 +115,17 @@ def extrair_com_ia(conteudo_bytes: bytes, mime_type: str, texto_extraido: str = 
             instrucao
         ]
 
-    modelos = ["gemini-3.8-flash", "gemini-3.5-flash-lite"]
+    modelos_gemini = [
+        "gemini-3.5-flash-lite",
+        "gemini-3.5-flash",
+        "gemini-3.7-flash",
+        "gemini-3.8-flash",
+    ]
     ultimo_erro = None
 
-    for modelo in modelos:
+    for modelo in modelos_gemini:
         try:
-            print(f"Tentando extrair com o modelo: {modelo} ({mime_type})...")
+            print(f"Tentando Gemini: {modelo} ({mime_type})...")
             response = client.models.generate_content(
                 model=modelo,
                 contents=contents,
@@ -118,28 +135,58 @@ def extrair_com_ia(conteudo_bytes: bytes, mime_type: str, texto_extraido: str = 
                     temperature=0.0,
                 ),
             )
-            print(f"Sucesso com {modelo}!")
+            print(f"Sucesso com Gemini ({modelo})!")
             return json.loads(response.text)
         except Exception as e:
-            print(f"Falha no modelo {modelo}: {e}")
+            print(f"Falha no Gemini {modelo}: {e}")
             ultimo_erro = e
 
+    # --- CAMADA 2: Groq (Multi-Provider Fallback ultra-rápido) ---
+    if groq_client:
+        try:
+            if texto_extraido:
+                print("Acionando Plano B (Groq Llama 3.3 70B)...")
+                chat = groq_client.chat.completions.create(
+                    model="llama-3.3-70b-versatile",
+                    messages=[{"role": "user", "content": f"{instrucao}\n\nTexto:\n{texto_extraido}"}],
+                    response_format={"type": "json_object"},
+                    temperature=0.0,
+                )
+                print("Sucesso com Groq (llama-3.3-70b)!")
+                return json.loads(chat.choices[0].message.content)
+
+            elif mime_type.startswith("image/"):
+                print("Acionando Plano B Visual (Groq Llama 4 Scout)...")
+                img_b64 = base64.b64encode(conteudo_bytes).decode("utf-8")
+                chat = groq_client.chat.completions.create(
+                    model="meta-llama/llama-4-scout-17b-16e-instruct",
+                    messages=[{
+                        "role": "user",
+                        "content": [
+                            {"type": "text", "text": instrucao},
+                            {"type": "image_url", "image_url": {"url": f"data:{mime_type};base64,{img_b64}"}},
+                        ],
+                    }],
+                    response_format={"type": "json_object"},
+                    temperature=0.0,
+                )
+                print("Sucesso com Groq Vision (llama-4-scout)!")
+                return json.loads(chat.choices[0].message.content)
+        except Exception as e:
+            print(f"Falha no Groq: {e}")
+            ultimo_erro = e
+
+    # --- CAMADA 3: Contingência Offline (Tesseract OCR + Regex) ---
     if texto_extraido:
         return fallback_regex(texto_extraido)
 
-    # Se a IA falhar e houver texto nativo, aciona o Plano C (Regex)
-    if texto_extraido:
-        return fallback_regex(texto_extraido)
-
-    # Se a IA falhar e for uma imagem (PNG/JPG), faz OCR local com Tesseract e passa no Regex
     if mime_type.startswith("image/"):
-        print("Usando OCR local (Tesseract) + Regex devido à instabilidade na API...")
+        print("Usando OCR local (Tesseract) + Regex...")
         imagem = Image.open(io.BytesIO(conteudo_bytes))
         texto_ocr = pytesseract.image_to_string(imagem, lang="por")
         return fallback_regex(texto_ocr)
 
     raise ultimo_erro
-
 # 4. Interface Web (Aceita PDF, JPG e PNG)
 @app.get("/", response_class=HTMLResponse)
 async def home():
